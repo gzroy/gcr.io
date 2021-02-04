@@ -1,29 +1,78 @@
-ARG binary_name=kfctl
-FROM registry.access.redhat.com/ubi8/ubi-minimal:latest AS build
+#**********************************************************************
+# Builder
+# Create a go runtime suitable for building and testing kfctl
+ARG GOLANG_VERSION=1.13.7
+FROM golang:$GOLANG_VERSION as builder
 
-ENV OPERATOR=/usr/local/bin/${binary_name} \
-    USER_UID=1001 \
-    USER_NAME=kfctl \
-    HOMEDIR=/homedir
+ARG BRANCH=master
+ARG REPO=https://github.com/kubeflow/kubeflow
 
-# install operator binary
-COPY _output/bin/${binary_name} ${OPERATOR}
+RUN apt-get update
+RUN apt-get install -y git unzip jq vim
 
-COPY bin /usr/local/bin
-RUN  /usr/local/bin/user_setup
-RUN  /usr/local/bin/entrypoint
+# junit report is used to conver go test output to junit for reporting
+RUN go get -u github.com/jstemmer/go-junit-report
 
-FROM gcr.io/distroless/base-debian10
-ENV OPERATOR=/usr/local/bin/${binary_name} \
-    USER_UID=1001 \
-    USER_NAME=kfctl \
-    HOMEDIR=/homedir
+# We need gcloud to get gke credentials.
+RUN if [ "$(uname -m)" = "x86_64" ]; then \
+        cd /tmp && \
+        wget -nv https://dl.google.com/dl/cloudsdk/release/install_google_cloud_sdk.bash && \
+        chmod +x install_google_cloud_sdk.bash && \
+        ./install_google_cloud_sdk.bash --disable-prompts --install-dir=/opt/; \
+    fi
 
-COPY --from=build /usr/local/bin/${binary_name} ${OPERATOR}
-COPY --from=build /etc/passwd /etc/passwd
-COPY --from=build ${HOMEDIR} ${HOME}
+ENV PATH /go/bin:/usr/local/go/bin:/opt/google-cloud-sdk/bin:${PATH}
 
-ENTRYPOINT ["${OPERATOR}"]
+# use go modules
+ENV GO111MODULE=on
+ENV GOPATH=/go
+# Workaround for https://github.com/kubernetes/gengo/issues/146
+ENV GOROOT=/usr/local/go
 
-USER ${USER_UID}
-MAINTAINER gzroy <gzroy@163.com>
+# Create kfctl folder
+RUN mkdir -p ${GOPATH}/src/github.com/kubeflow/kfctl
+WORKDIR ${GOPATH}/src/github.com/kubeflow
+RUN mkdir kubeflow
+RUN echo REPO=${REPO} branch=${BRANCH}
+RUN git clone ${REPO} --depth=1 --branch ${BRANCH} --single-branch kubeflow
+WORKDIR ${GOPATH}/src/github.com/kubeflow/kfctl
+
+# Download dependencies first to optimize Docker caching.
+COPY go.mod .
+COPY go.sum .
+RUN go mod download
+# Copy in the source
+COPY . .
+
+#**********************************************************************
+#
+# kfctl_base
+#
+FROM builder as kfctl_base
+
+RUN make build-kfctl && \
+    if [ "$(uname -m)" = "aarch64" ]; then \
+        cp bin/arm64/kfctl bin/kfctl; \
+    fi
+
+#**********************************************************************
+#
+# Final image base
+#
+
+FROM alpine:3.10.1 as barebones_base
+RUN mkdir -p /opt/kubeflow
+WORKDIR /opt/kubeflow
+
+#**********************************************************************
+#
+# kfctl
+#
+FROM barebones_base as kfctl
+
+COPY --from=kfctl_base /go/src/github.com/kubeflow/kfctl/bin/kfctl /usr/local/bin
+COPY --from=kfctl_base /go/src/github.com/kubeflow/kfctl/third_party /third_party
+COPY --from=kfctl_base /go/pkg/mod /third_party/vendor
+
+
+CMD ["/bin/bash", "-c", "trap : TERM INT; sleep infinity & wait"]
