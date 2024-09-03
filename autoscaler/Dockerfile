@@ -1,0 +1,2 @@
+From gcr.io/knative-releases/knative.dev/serving/cmd/autoscaler@sha256:66aa0dbceee62691d5327e423bbd7cbd411903747adeab61fdc81b14590793d4
+MAINTAINER gzroy <gzroy@163.com>
